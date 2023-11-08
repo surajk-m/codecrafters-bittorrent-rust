@@ -1,76 +1,172 @@
-use serde_json;
-use std::env;
-use serde_json::Map;
+use anyhow::Context;
+use clap::{Parser, Subcommand};
+use hashes::Hashes;
+use serde::Deserialize;
+use serde_json::{Map, Value};
+use std::fs::read;
+use std::path::PathBuf;
 
-fn decode_bencoded_value(encoded_value: &str) -> (serde_json::Value, &str) {
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    Decode { value: String },
+    Info { torrent: PathBuf },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Torrent {
+    announce: String,
+    info: Info,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Info {
+    name: String,
+    #[serde(rename = "piece length")]
+    plength: usize,
+    pieces: Hashes,
+    #[serde(flatten)]
+    keys: Keys,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum Keys {
+    SingleFile { length: usize },
+    MultiFile { files: Vec<File> },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct File {
+    length: usize,
+    path: Vec<String>,
+}
+
+fn decode_bencoded_value(encoded_value: &str) -> Result<(Value, &str), anyhow::Error> {
     match encoded_value.chars().next() {
         Some('i') => {
-            if let Some((n, rest)) = encoded_value
+            let (n, rest) = encoded_value
                 .split_at(1)
                 .1
                 .split_once('e')
                 .and_then(|(digits, rest)| {
                     let n = digits.parse::<i64>().ok()?;
-                    Some((n, rest))
+                    Some((n.into(), rest))
                 })
-            {
-                return (n.into(), rest);
-            }
+                .ok_or_else(|| anyhow::anyhow!("Failed to parse integer"))?;
+            Ok((n, rest))
         }
         Some('l') => {
             let mut values = Vec::new();
             let mut rest = encoded_value.split_at(1).1;
             while !rest.is_empty() && rest.starts_with(|c| c != 'e') {
-                let (v, remainder) = decode_bencoded_value(rest);
+                let (v, remainder) = decode_bencoded_value(rest)?;
                 values.push(v);
                 rest = remainder;
             }
-            return (values.into(), &rest[1..]);
+            Ok((Value::Array(values), &rest[1..]))
         }
         Some('d') => {
-            let mut dict = serde_json::Map::new();
+            let mut dict = Map::new();
             let mut rest = encoded_value.split_at(1).1;
             while !rest.is_empty() && rest.starts_with(|c| c != 'e') {
-                let (key, remainder) = decode_bencoded_value(rest);
-                let (value, remainder) = decode_bencoded_value(remainder);
-                if let serde_json::Value::String(key_str) = key {
+                let (key, remainder) = decode_bencoded_value(rest)?;
+                let (value, remainder) = decode_bencoded_value(remainder)?;
+                if let Value::String(key_str) = key {
                     dict.insert(key_str, value);
                 } else {
-                    panic!("Dictionary keys must be strings.");
+                    return Err(anyhow::anyhow!("Dictionary keys must be strings"));
                 }
                 rest = remainder;
             }
-            
-            let json_map: Map<String, serde_json::Value> = dict.into_iter().collect();
-            return (serde_json::Value::Object(json_map), &rest[1..]);
+            let json_map: Map<String, Value> = dict.into_iter().collect();
+            Ok((Value::Object(json_map), &rest[1..]))
         }
-
         Some('0'..='9') => {
-            if let Some((len, rest)) = encoded_value.split_once(':') {
-                if let Ok(len) = len.parse::<usize>() {
-                    return (rest[..len].to_string().into(), &rest[len..]);
-                }
-            }
+            let (len, rest) = encoded_value.split_once(':').ok_or_else(|| {
+                anyhow::anyhow!("Failed to split length and remainder for string")
+            })?;
+            let len = len
+                .parse::<usize>()
+                .map_err(|_| anyhow::anyhow!("Failed to parse length"))?;
+            Ok((Value::String(rest[..len].to_string()), &rest[len..]))
         }
-        _ => {}
+        _ => Err(anyhow::anyhow!(
+            "Unhandled encoded value: {}",
+            encoded_value
+        )),
     }
-
-    panic!("Unhandled encoded value: {}", encoded_value);
 }
 
+fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
 
-// Usage: your_bittorrent.sh decode "<encoded_value>"
-fn main() {
-    let args: Vec<String> = env::args().collect();
-    let command = &args[1];
+    match args.command {
+        Command::Decode { value } => {
+            eprintln!("Logs from your program will appear here!");
+            let decoded_value = decode_bencoded_value(&value)?;
+            println!("{}", decoded_value.0.to_string());
+        }
+        Command::Info { torrent } => {
+            let dot_torrent = read(&torrent).context("read torrent file")?;
+            let t: Torrent =
+                serde_bencode::from_bytes(&dot_torrent).context("parse torrent file")?;
+            eprintln!("{t:?}");
+            println!("Tracker URL: {}", t.announce);
 
-    if command == "decode" {
-        eprintln!("Logs from your program will appear here!");
+            match t.info.keys {
+                Keys::SingleFile { length } => println!("Length: {}", length),
+                _ => todo!(),
+            }
+        }
+    }
 
-        let encoded_value = &args[2];
-        let decoded_value = decode_bencoded_value(encoded_value);
-        println!("{}", decoded_value.0.to_string());
-    } else {
-        eprintln!("unknown command: {}", args[1])
+    Ok(())
+}
+
+mod hashes {
+    use serde::de::{self, Deserialize, Deserializer, Visitor};
+    use std::fmt;
+
+    #[derive(Debug, Clone)]
+    pub struct Hashes(pub Vec<[u8; 20]>);
+    struct HashesVisitor;
+
+    impl<'de> Visitor<'de> for HashesVisitor {
+        type Value = Hashes;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a byte string whose length is a multiple of 20")
+        }
+
+        fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            if v.len() % 20 != 0 {
+                return Err(E::custom(format!("length is {}", v.len())));
+            }
+            // TODO: use array_chunks when stable
+            Ok(Hashes(
+                v.chunks_exact(20)
+                    .map(|slice_20| slice_20.try_into().expect("guaranteed to be length 20"))
+                    .collect(),
+            ))
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Hashes {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserializer.deserialize_bytes(HashesVisitor)
+        }
     }
 }
