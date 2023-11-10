@@ -1,8 +1,9 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use hashes::Hashes;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha1::{Digest, Sha1};
 use std::fs::read;
 use std::path::PathBuf;
 
@@ -19,13 +20,13 @@ enum Command {
     Info { torrent: PathBuf },
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct Torrent {
     announce: String,
     info: Info,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct Info {
     name: String,
     #[serde(rename = "piece length")]
@@ -35,14 +36,14 @@ struct Info {
     keys: Keys,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 enum Keys {
     SingleFile { length: usize },
     MultiFile { files: Vec<File> },
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct File {
     length: usize,
     path: Vec<String>,
@@ -124,6 +125,13 @@ fn main() -> anyhow::Result<()> {
                 Keys::SingleFile { length } => println!("Length: {}", length),
                 _ => todo!(),
             }
+
+            let info_encoded =
+                serde_bencode::to_bytes(&t.info).context("re-encode info section")?;
+            let mut hasher = Sha1::new();
+            hasher.update(&info_encoded);
+            let info_hash = hasher.finalize();
+            println!("Info Hash: {}", hex::encode(&info_hash));
         }
     }
 
@@ -132,6 +140,7 @@ fn main() -> anyhow::Result<()> {
 
 mod hashes {
     use serde::de::{self, Deserialize, Deserializer, Visitor};
+    use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
     use std::fmt;
 
     #[derive(Debug, Clone)]
@@ -167,6 +176,16 @@ mod hashes {
             D: Deserializer<'de>,
         {
             deserializer.deserialize_bytes(HashesVisitor)
+        }
+    }
+
+    impl Serialize for Hashes {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            let single_slice = self.0.concat();
+            serializer.serialize_bytes(&single_slice)
         }
     }
 }
