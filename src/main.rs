@@ -4,9 +4,9 @@ use bittorrent_starter_rust::torrent::{self, Torrent};
 use bittorrent_starter_rust::tracker::*;
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
-use sha1::{Digest, Sha1};
 use serde_bencode;
 use serde_json::{Map, Value};
+use sha1::{Digest, Sha1};
 use std::fs::read;
 use std::net::SocketAddrV4;
 use std::path::PathBuf;
@@ -25,13 +25,20 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    Decode { value: String },
-    Info { torrent: PathBuf },
-    Peers { torrent: PathBuf },
-    Handshake { 
-        torrent: PathBuf, 
-        peer: String 
+    Decode {
+        value: String,
     },
+    Info {
+        torrent: PathBuf,
+    },
+    Peers {
+        torrent: PathBuf,
+    },
+    Handshake {
+        torrent: PathBuf,
+        peer: String,
+    },
+    #[clap(name = "download_piece")]
     DownloadPiece {
         #[arg(short)]
         output: PathBuf,
